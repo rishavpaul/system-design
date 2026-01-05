@@ -56,6 +56,32 @@ This repository contains a production-ready rate limiter implementation using th
   - [Q9. Why 16,384 Slots? How Does Redis Distribute Them?](#q9-why-16384-slots-how-does-redis-distribute-them)
   - [Q10. Hot Clients and Multi-Tenant Fairness](#q10-hot-clients-and-multi-tenant-fairness)
 - [Performance Characteristics](#performance-characteristics)
+- [Observability & Monitoring](#observability--monitoring)
+  - [Metrics (RED Method)](#metrics-red-method)
+  - [Dashboards (Grafana)](#dashboards-grafana)
+  - [Distributed Tracing (OpenTelemetry)](#distributed-tracing-opentelemetry)
+  - [Alerting Rules (Prometheus)](#alerting-rules-prometheus)
+  - [Logging Strategy](#logging-strategy)
+  - [SLIs/SLOs](#slisslos-service-level-objectives)
+  - [On-Call Runbook](#on-call-runbook)
+- [Operational Excellence](#operational-excellence)
+  - [Deployment Strategy](#deployment-strategy)
+  - [Capacity Planning](#capacity-planning)
+  - [Rollback Procedure](#rollback-procedure)
+  - [Capacity Limits & Scaling Triggers](#capacity-limits--scaling-triggers)
+- [Cost Analysis](#cost-analysis)
+  - [AWS Cost Breakdown](#aws-cost-breakdown-100k-reqsec-10m-clients)
+  - [Cost Optimization Strategies](#cost-optimization-strategies)
+  - [Cost vs. Scale](#cost-vs-scale)
+- [Security Considerations](#security-considerations)
+  - [Network Security](#network-security)
+  - [DDoS Protection](#ddos-protection)
+  - [Secrets Management](#secrets-management)
+  - [Audit Logging](#audit-logging)
+- [Alternative Designs & Trade-offs](#alternative-designs--trade-offs)
+  - [When NOT to Use This Approach](#when-not-to-use-this-approach)
+  - [Alternative Technologies](#alternative-technologies)
+  - [Migration Path (Zero Downtime)](#migration-path-zero-downtime)
 - [Production Considerations](#production-considerations)
 - [What We Didn't Build](#what-we-didnt-build)
 - [Additional Documentation](#additional-documentation)
@@ -2669,6 +2695,1016 @@ func (mc *MetricsCollector) RecordRequest(clientIP, shard string, latency time.D
 - **Memory per client**: ~100 bytes (hash with 2 fields + key)
 - **Scaling**: 10M clients ≈ 1GB Redis memory
 - **Throughput**: Limited by Redis; single instance handles 100k+ ops/sec
+
+## Observability & Monitoring
+
+**Staff engineers are judged on operational excellence**. A rate limiter without observability is a black box waiting to fail in production.
+
+### Metrics (RED Method)
+
+Implement the **R**ate, **E**rrors, **D**uration pattern:
+
+```go
+// gateway/metrics/metrics.go
+package metrics
+
+import "github.com/prometheus/client_golang/prometheus"
+
+var (
+    // Rate: Requests per second
+    RequestsTotal = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "rate_limiter_requests_total",
+            Help: "Total number of rate limit checks",
+        },
+        []string{"client_ip", "allowed", "shard"},
+    )
+
+    // Errors: Rate limit rejections + Redis errors
+    RateLimitExceeded = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "rate_limiter_rejected_total",
+            Help: "Total number of rejected requests",
+        },
+        []string{"client_ip", "shard"},
+    )
+
+    RedisErrors = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "rate_limiter_redis_errors_total",
+            Help: "Total Redis errors (fail-open events)",
+        },
+        []string{"error_type", "shard"},
+    )
+
+    // Duration: Latency distribution
+    RequestDuration = prometheus.NewHistogramVec(
+        prometheus.HistogramOpts{
+            Name:    "rate_limiter_duration_seconds",
+            Help:    "Rate limiter check latency",
+            Buckets: []float64{0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1},
+        },
+        []string{"shard"},
+    )
+
+    // Additional metrics
+    ActiveConnections = prometheus.NewGaugeVec(
+        prometheus.GaugeOpts{
+            Name: "rate_limiter_redis_connections_active",
+            Help: "Active Redis connections per shard",
+        },
+        []string{"shard"},
+    )
+
+    TokensRemaining = prometheus.NewHistogramVec(
+        prometheus.HistogramOpts{
+            Name:    "rate_limiter_tokens_remaining",
+            Help:    "Distribution of remaining tokens",
+            Buckets: []float64{0, 1, 2, 5, 10, 20, 50, 100},
+        },
+        []string{"client_tier"}, // premium, standard, free
+    )
+)
+
+func init() {
+    prometheus.MustRegister(
+        RequestsTotal,
+        RateLimitExceeded,
+        RedisErrors,
+        RequestDuration,
+        ActiveConnections,
+        TokensRemaining,
+    )
+}
+```
+
+**Usage in handler**:
+
+```go
+func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request) {
+    start := time.Now()
+    clientIP := getClientIP(r)
+
+    result, err := g.limiter.Allow(r.Context(), "ratelimit:"+clientIP)
+
+    duration := time.Since(start).Seconds()
+    shard := getShardForKey("ratelimit:" + clientIP)
+
+    if err != nil {
+        metrics.RedisErrors.WithLabelValues("connection_error", shard).Inc()
+        metrics.RequestDuration.WithLabelValues(shard).Observe(duration)
+        // Fail open...
+        return
+    }
+
+    allowed := "true"
+    if !result.Allowed {
+        allowed = "false"
+        metrics.RateLimitExceeded.WithLabelValues(clientIP, shard).Inc()
+    }
+
+    metrics.RequestsTotal.WithLabelValues(clientIP, allowed, shard).Inc()
+    metrics.RequestDuration.WithLabelValues(shard).Observe(duration)
+    metrics.TokensRemaining.WithLabelValues(getTier(clientIP)).Observe(float64(result.Remaining))
+
+    // ... rest of handler
+}
+```
+
+### Dashboards (Grafana)
+
+**Key Panels**:
+
+```yaml
+# Rate Limiter Overview Dashboard
+
+Panel 1: Request Rate (QPS)
+  Query: rate(rate_limiter_requests_total[1m])
+  Alert: > 100k req/sec per gateway (approaching capacity)
+
+Panel 2: Rejection Rate
+  Query: rate(rate_limiter_rejected_total[1m]) / rate(rate_limiter_requests_total[1m])
+  Alert: > 50% rejection rate (too restrictive or attack)
+
+Panel 3: Latency (p50, p95, p99)
+  Query: histogram_quantile(0.99, rate(rate_limiter_duration_seconds_bucket[5m]))
+  Alert: p99 > 10ms (Redis performance degraded)
+
+Panel 4: Error Rate
+  Query: rate(rate_limiter_redis_errors_total[1m])
+  Alert: > 1% error rate (Redis connectivity issues)
+
+Panel 5: Top Offenders (Hot Clients)
+  Query: topk(10, rate(rate_limiter_rejected_total[5m]))
+  Use: Identify clients to penalize or upgrade
+
+Panel 6: Redis Connection Pool
+  Query: rate_limiter_redis_connections_active
+  Alert: > 90 connections (approaching pool limit of 100)
+
+Panel 7: Tokens Distribution Heatmap
+  Query: rate_limiter_tokens_remaining_bucket
+  Use: Understand client behavior (always at 0 = too restrictive)
+```
+
+### Distributed Tracing (OpenTelemetry)
+
+```go
+// gateway/tracing/tracing.go
+import (
+    "go.opentelemetry.io/otel"
+    "go.opentelemetry.io/otel/trace"
+)
+
+func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    tracer := otel.Tracer("rate-limiter")
+
+    ctx, span := tracer.Start(ctx, "rate_limit_check")
+    defer span.End()
+
+    span.SetAttributes(
+        attribute.String("client.ip", getClientIP(r)),
+        attribute.String("request.path", r.URL.Path),
+    )
+
+    // Redis rate limit check (instrumented)
+    ctx, redisSpan := tracer.Start(ctx, "redis.token_bucket_check")
+    result, err := g.limiter.Allow(ctx, "ratelimit:"+clientIP)
+    redisSpan.SetAttributes(
+        attribute.Int64("tokens.remaining", result.Remaining),
+        attribute.Bool("allowed", result.Allowed),
+    )
+    redisSpan.End()
+
+    if !result.Allowed {
+        span.SetAttributes(attribute.String("decision", "rejected"))
+        span.SetStatus(codes.Error, "rate limit exceeded")
+    }
+
+    // Backend proxy (propagates trace context)
+    ctx, backendSpan := tracer.Start(ctx, "backend.proxy")
+    g.proxy.ServeHTTP(w, r.WithContext(ctx))
+    backendSpan.End()
+}
+```
+
+**Trace example**:
+```
+Trace ID: abc123...
+├─ rate_limit_check (2ms)
+│  ├─ redis.token_bucket_check (1.2ms)
+│  │  └─ attributes: {shard: "master-1", tokens.remaining: 5}
+│  └─ backend.proxy (50ms)
+│     └─ attributes: {backend.status: 200}
+```
+
+### Alerting Rules (Prometheus)
+
+```yaml
+# alerts/rate_limiter.yml
+groups:
+  - name: rate_limiter_alerts
+    interval: 30s
+    rules:
+      # Critical: Redis down
+      - alert: RateLimiterRedisDown
+        expr: rate(rate_limiter_redis_errors_total[1m]) > 10
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Rate limiter failing open (Redis unavailable)"
+          description: "{{ $value }} Redis errors/sec. All requests being allowed."
+
+      # Warning: High latency
+      - alert: RateLimiterHighLatency
+        expr: histogram_quantile(0.99, rate(rate_limiter_duration_seconds_bucket[5m])) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Rate limiter p99 latency > 10ms"
+          description: "p99 latency: {{ $value }}s. Check Redis shard health."
+
+      # Warning: Hot client
+      - alert: HotClientDetected
+        expr: rate(rate_limiter_requests_total{client_ip=~".+"}[1m]) > 1000
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Client {{ $labels.client_ip }} sending {{ $value }} req/sec"
+          description: "Potential abuse or misconfigured client."
+
+      # Critical: High rejection rate
+      - alert: HighRejectionRate
+        expr: |
+          rate(rate_limiter_rejected_total[5m])
+          /
+          rate(rate_limiter_requests_total[5m]) > 0.5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of requests rejected"
+          description: "Rate limits may be too restrictive or under attack."
+
+      # Info: Connection pool exhaustion approaching
+      - alert: RedisConnectionPoolHigh
+        expr: rate_limiter_redis_connections_active / 100 > 0.8
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "Redis connection pool at {{ $value | humanizePercentage }}"
+          description: "Consider increasing PoolSize or adding gateway instances."
+```
+
+### Logging Strategy
+
+**Structured logging with context**:
+
+```go
+// gateway/logging/logger.go
+import "github.com/sirupsen/logrus"
+
+var log = logrus.New()
+
+func init() {
+    log.SetFormatter(&logrus.JSONFormatter{})
+    log.SetLevel(logrus.InfoLevel)
+}
+
+// In handler
+func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request) {
+    clientIP := getClientIP(r)
+    requestID := r.Header.Get("X-Request-ID")
+
+    logger := log.WithFields(logrus.Fields{
+        "request_id": requestID,
+        "client_ip":  clientIP,
+        "path":       r.URL.Path,
+        "method":     r.Method,
+    })
+
+    result, err := g.limiter.Allow(r.Context(), "ratelimit:"+clientIP)
+
+    if err != nil {
+        logger.WithError(err).Error("rate limiter redis error, failing open")
+        // Emit metric...
+        return
+    }
+
+    if !result.Allowed {
+        logger.WithFields(logrus.Fields{
+            "tokens_remaining": result.Remaining,
+            "retry_after_sec":  result.RetryAfter.Seconds(),
+        }).Warn("rate limit exceeded")
+        // Return 429...
+        return
+    }
+
+    logger.WithFields(logrus.Fields{
+        "tokens_remaining": result.Remaining,
+        "latency_ms":       time.Since(start).Milliseconds(),
+    }).Info("request allowed")
+}
+```
+
+**Log levels**:
+- `ERROR`: Redis failures, connection errors
+- `WARN`: Rate limit exceeded, degraded mode
+- `INFO`: Normal operations (sampled 1% in production)
+- `DEBUG`: Verbose (disabled in production)
+
+**Example log output**:
+```json
+{
+  "level": "warn",
+  "msg": "rate limit exceeded",
+  "request_id": "req-abc123",
+  "client_ip": "192.168.1.1",
+  "path": "/api/resource",
+  "method": "GET",
+  "tokens_remaining": 0,
+  "retry_after_sec": 3,
+  "timestamp": "2026-01-04T22:45:00Z"
+}
+```
+
+### SLIs/SLOs (Service Level Objectives)
+
+Define what "good" looks like:
+
+```yaml
+# Rate Limiter SLOs
+Availability SLO: 99.9% (43 minutes downtime/month)
+  Measurement:
+    - success_rate = (total_requests - redis_errors) / total_requests
+    - Target: success_rate >= 99.9%
+
+Latency SLO: p99 < 5ms
+  Measurement:
+    - histogram_quantile(0.99, rate_limiter_duration_seconds_bucket)
+    - Target: p99 < 5ms
+
+Accuracy SLO: <0.1% false rejections
+  Measurement:
+    - False rejections (client had tokens but got 429 due to race condition)
+    - Target: < 0.1% of all requests
+
+Error Budget:
+  - 99.9% availability = 0.1% error budget
+  - 1M req/day * 0.1% = 1,000 allowed failures/day
+  - Burn rate alert: If consuming >10% budget/hour, page on-call
+```
+
+### On-Call Runbook
+
+**Symptom**: High Redis error rate (failing open)
+
+```bash
+# 1. Check Redis cluster health
+redis-cli --cluster check localhost:7000
+
+# 2. Check if masters are reachable
+for port in 7000 7001 7002; do
+  redis-cli -p $port ping || echo "Master $port DOWN"
+done
+
+# 3. Check replication lag
+redis-cli -p 7000 INFO replication | grep lag
+
+# 4. If cluster is down, check logs
+kubectl logs -l app=redis --tail=100
+
+# 5. Temporary mitigation: Increase fail-open timeout
+# Or: Route traffic to secondary region
+```
+
+**Symptom**: p99 latency spike (>10ms)
+
+```bash
+# 1. Check slow queries
+redis-cli SLOWLOG GET 10
+
+# 2. Check CPU usage
+redis-cli INFO cpu
+
+# 3. Check connection count
+redis-cli CLIENT LIST | wc -l
+
+# 4. Check if a single client is hammering
+redis-cli --bigkeys
+
+# 5. Mitigation: Temporarily increase bucket size (reduces Redis calls)
+# Or: Add more Redis shards
+```
+
+## Operational Excellence
+
+### Deployment Strategy
+
+**Blue-Green Deployment**:
+
+```yaml
+# kubernetes/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rate-limiter-gateway-blue
+spec:
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: rate-limiter
+        version: blue
+
+---
+# After validation, switch traffic
+apiVersion: v1
+kind: Service
+metadata:
+  name: rate-limiter-gateway
+spec:
+  selector:
+    app: rate-limiter
+    version: blue  # Change to 'green' to switch
+```
+
+**Canary Deployment** (10% → 50% → 100%):
+
+```yaml
+# Using Istio VirtualService
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: rate-limiter-canary
+spec:
+  hosts:
+    - rate-limiter.example.com
+  http:
+    - match:
+        - headers:
+            canary:
+              exact: "true"
+      route:
+        - destination:
+            host: rate-limiter-gateway
+            subset: v2
+    - route:
+        - destination:
+            host: rate-limiter-gateway
+            subset: v1
+          weight: 90
+        - destination:
+            host: rate-limiter-gateway
+            subset: v2
+          weight: 10
+```
+
+### Capacity Planning
+
+**Gateway sizing**:
+
+```
+Target: 100k requests/sec
+Gateway capacity: 10k req/sec per instance
+Required: 10 gateway instances + 20% headroom = 12 instances
+
+CPU: 2 vCPUs per gateway (Go is efficient)
+Memory: 512MB per gateway (connection pools + metrics)
+Network: 1 Gbps (rate limiting is lightweight)
+
+Cost (AWS t3.small): $0.0208/hour
+12 instances * $0.0208 * 730 hours/month = $182/month
+```
+
+**Redis cluster sizing**:
+
+```
+Target: 100k requests/sec, 10M unique clients
+Throughput per shard: 100k ops/sec
+Required shards: 1 shard (well within capacity)
+Recommended: 3 shards (for HA + future growth)
+
+Memory calculation:
+- 10M clients * 100 bytes/client = 1GB data
+- Replication factor: 2x (1 replica per master)
+- Overhead: 20% (fragmentation, AOF buffers)
+- Total: 1GB * 2 * 1.2 = 2.4GB per shard
+- Recommended: 8GB per shard (allows 30M clients)
+
+Cost (AWS ElastiCache r6g.large):
+- 3 shards * $0.226/hour * 730 hours = $495/month
+- 3 replicas * $0.226/hour * 730 hours = $495/month
+- Total: $990/month
+```
+
+**Total monthly cost**: ~$1,200 for 100k req/sec, 10M clients
+
+### Rollback Procedure
+
+**If rate limiter has a bug**:
+
+```bash
+# Step 1: Immediate mitigation (disable rate limiting)
+kubectl set env deployment/rate-limiter-gateway RATE_LIMIT_ENABLED=false
+
+# Step 2: Verify requests flowing normally
+curl http://gateway/health
+
+# Step 3: Investigate root cause (check logs, metrics)
+kubectl logs -l app=rate-limiter --tail=1000 | grep ERROR
+
+# Step 4: Rollback deployment
+kubectl rollout undo deployment/rate-limiter-gateway
+
+# Step 5: Verify previous version working
+kubectl rollout status deployment/rate-limiter-gateway
+```
+
+**Feature flag approach** (preferred):
+
+```go
+// gateway/main.go
+func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request) {
+    // Check feature flag (LaunchDarkly, etc.)
+    if !featureFlags.IsEnabled("rate_limiting", getClientIP(r)) {
+        g.proxy.ServeHTTP(w, r)  // Bypass rate limiter
+        return
+    }
+
+    // Normal rate limiting flow...
+}
+```
+
+### Capacity Limits & Scaling Triggers
+
+**Autoscaling rules**:
+
+```yaml
+# kubernetes/hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rate-limiter-gateway
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: rate-limiter-gateway
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Pods
+      pods:
+        metric:
+          name: rate_limiter_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "8000"  # Scale at 8k req/sec per pod
+```
+
+**Redis cluster scaling**:
+
+```bash
+# Add a new master shard when:
+# - Throughput > 80k ops/sec per shard
+# - Memory usage > 80%
+# - Hot client identified (>10% of traffic)
+
+./run.sh cluster-add-shard
+# This triggers slot resharding (see Q8)
+```
+
+## Cost Analysis
+
+### AWS Cost Breakdown (100k req/sec, 10M clients)
+
+| Component | Instance Type | Count | Cost/Hour | Hours/Month | Monthly Cost |
+|-----------|--------------|-------|-----------|-------------|--------------|
+| **Gateway** | t3.small (2 vCPU, 2GB) | 12 | $0.0208 | 730 | $182 |
+| **Redis Masters** | r6g.large (2 vCPU, 16GB) | 3 | $0.226 | 730 | $495 |
+| **Redis Replicas** | r6g.large (2 vCPU, 16GB) | 3 | $0.226 | 730 | $495 |
+| **Load Balancer** | ALB | 1 | $0.0225 | 730 | $16 |
+| **Data Transfer** | Out to internet | - | $0.09/GB | - | $100 (est) |
+| **CloudWatch** | Metrics + Logs | - | - | - | $50 (est) |
+| **Total** | | | | | **$1,338/month** |
+
+**Cost per million requests**: $1,338 / (100k * 86400 * 30) = **$0.005**
+
+### Cost Optimization Strategies
+
+**1. Reserved Instances** (1-year commitment):
+```
+Savings: ~40% on EC2 and ElastiCache
+New monthly cost: $1,338 * 0.6 = $803/month
+Annual savings: ($1,338 - $803) * 12 = $6,420
+```
+
+**2. Spot Instances for gateways** (non-critical workload):
+```
+Savings: ~70% on gateway instances
+New gateway cost: $182 * 0.3 = $55/month
+Risk: Instances can be terminated (acceptable with autoscaling)
+```
+
+**3. Right-sizing**:
+```
+If actual traffic is 50k req/sec:
+- Gateway: 6 instances instead of 12 → Save $91/month
+- Redis: Downgrade to r6g.medium → Save $495/month
+Total savings: ~$586/month (44%)
+```
+
+**4. Use managed services**:
+```
+AWS API Gateway with rate limiting:
+- Cost: $3.50/million requests
+- 100k req/sec * 86400 * 30 = 259M req/month
+- Cost: 259M * $3.50/1M = $907/month
+- Trade-off: Less control, vendor lock-in, but no ops burden
+```
+
+### Cost vs. Scale
+
+| Traffic | Gateway Instances | Redis Shards | Monthly Cost | Cost/1M Requests |
+|---------|------------------|--------------|--------------|------------------|
+| 10k req/sec | 2 | 3 (minimal) | $500 | $0.020 |
+| 100k req/sec | 12 | 3 | $1,338 | $0.005 |
+| 1M req/sec | 120 | 12 | $12,000 | $0.0046 |
+| 10M req/sec | 1,200 | 50 | $110,000 | $0.0042 |
+
+**Economies of scale**: Cost per request decreases as volume increases.
+
+## Security Considerations
+
+### Network Security
+
+**VPC Isolation**:
+```yaml
+# terraform/vpc.tf
+resource "aws_vpc" "rate_limiter" {
+  cidr_block = "10.0.0.0/16"
+}
+
+resource "aws_subnet" "private" {
+  vpc_id     = aws_vpc.rate_limiter.id
+  cidr_block = "10.0.1.0/24"
+  # Redis nodes here (no public IP)
+}
+
+resource "aws_subnet" "public" {
+  vpc_id     = aws_vpc.rate_limiter.id
+  cidr_block = "10.0.2.0/24"
+  # Gateway nodes here (behind ALB)
+}
+
+resource "aws_security_group" "redis" {
+  vpc_id = aws_vpc.rate_limiter.id
+
+  ingress {
+    from_port   = 6379
+    to_port     = 6379
+    protocol    = "tcp"
+    cidr_blocks = ["10.0.2.0/24"]  # Only from gateway subnet
+  }
+}
+```
+
+**TLS/Encryption**:
+
+```go
+// Enable TLS for Redis connections
+redisClient := redis.NewClusterClient(&redis.ClusterOptions{
+    Addrs: addrs,
+    TLSConfig: &tls.Config{
+        MinVersion: tls.VersionTLS12,
+        CipherSuites: []uint16{
+            tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        },
+    },
+})
+```
+
+**Redis AUTH**:
+
+```bash
+# redis.conf
+requirepass "strong-password-from-secrets-manager"
+
+# Rotate password every 90 days
+aws secretsmanager rotate-secret --secret-id redis-password
+```
+
+### DDoS Protection
+
+**Layer 4 (Network)**:
+- AWS Shield Standard (free, automatic)
+- Rate limiting at ALB (1000 req/sec per IP)
+
+**Layer 7 (Application)**:
+```yaml
+# AWS WAF rules
+- Rule: Block IPs with >10k req/min
+- Rule: Block requests without User-Agent
+- Rule: Geographic blocking (if applicable)
+- Rule: SQL injection / XSS patterns
+```
+
+**Our rate limiter** is the **last line of defense** (Layer 7.5):
+```
+Client → WAF (10k/min) → ALB (1k/sec) → Rate Limiter (100/sec) → Backend
+```
+
+### Secrets Management
+
+```go
+// gateway/config/secrets.go
+import "github.com/aws/aws-sdk-go/service/secretsmanager"
+
+func loadRedisPassword() string {
+    svc := secretsmanager.New(session.New())
+    result, err := svc.GetSecretValue(&secretsmanager.GetSecretValueInput{
+        SecretId: aws.String("prod/redis/password"),
+    })
+    if err != nil {
+        log.Fatal("Failed to load Redis password:", err)
+    }
+    return *result.SecretString
+}
+
+// In main.go
+redisPassword := loadRedisPassword()
+redisClient := redis.NewClient(&redis.Options{
+    Password: redisPassword,
+})
+```
+
+**Rotation strategy**:
+1. Create new password in Secrets Manager
+2. Add as secondary password in Redis: `ACL SETUSER default >newpass`
+3. Update gateways to use new password (rolling restart)
+4. Remove old password: `ACL DELUSER oldpass`
+
+### Audit Logging
+
+```go
+// Log all rate limit decisions for compliance
+func (g *Gateway) handleRequest(w http.ResponseWriter, r *http.Request) {
+    auditLog := log.WithFields(logrus.Fields{
+        "event_type":  "rate_limit_decision",
+        "client_ip":   getClientIP(r),
+        "user_agent":  r.UserAgent(),
+        "request_id":  r.Header.Get("X-Request-ID"),
+        "timestamp":   time.Now().Unix(),
+        "allowed":     result.Allowed,
+        "tokens_used": 1,
+    })
+
+    if !result.Allowed {
+        auditLog.Warn("request rejected by rate limiter")
+    } else {
+        auditLog.Info("request allowed by rate limiter")
+    }
+}
+```
+
+## Alternative Designs & Trade-offs
+
+### When NOT to Use This Approach
+
+**1. Extremely High Throughput (>10M req/sec)**
+
+Problem: Redis becomes the bottleneck
+```
+10M req/sec / 100k ops/sec per shard = 100 shards required
+Cost: 100 shards * $1,000/month = $100k/month (impractical)
+```
+
+Alternative: **Client-side rate limiting**
+```go
+// In client SDK
+type LocalRateLimiter struct {
+    bucket *rate.Limiter  // golang.org/x/time/rate
+}
+
+func (l *LocalRateLimiter) Allow() bool {
+    return l.bucket.Allow()  // No network call, instant
+}
+```
+
+Trade-offs:
+- ✓ Zero latency, infinite throughput
+- ✗ No global coordination (client can cheat)
+- ✗ Must distribute limits across clients
+
+**2. Global Rate Limits (total across all clients)**
+
+Problem: Need cross-shard coordination
+```
+Requirement: "100k total req/sec across ALL clients"
+Our implementation: Each client independent, no global limit
+```
+
+Alternative: **Centralized counter with async batching**
+```go
+// Batched increment every 100ms
+type GlobalRateLimiter struct {
+    localCounter atomic.Int64
+    redisKey     string
+}
+
+func (g *GlobalRateLimiter) Allow() bool {
+    // Optimistic: check local counter first
+    if g.localCounter.Load() < 10000 {  // 100k/sec * 0.1s = 10k batch
+        g.localCounter.Add(1)
+        return true
+    }
+
+    // Pessimistic: flush to Redis and reset
+    used := g.localCounter.Swap(0)
+    redis.IncrBy(g.redisKey, used)
+
+    global := redis.Get(g.redisKey)
+    return global < 100000
+}
+```
+
+Trade-offs:
+- ✓ Global limit enforced
+- ✗ ~10% inaccuracy (batching window)
+- ✗ Higher Redis load (flush every 100ms)
+
+**3. Strict SLA Requirements (99.99%+ uptime)**
+
+Problem: Redis failure = full outage (fail-open unacceptable)
+```
+Scenario: Billing API, quota enforcement
+Requirement: Never exceed quota (even if Redis down)
+```
+
+Alternative: **Multi-layer defense**
+```go
+type StrictRateLimiter struct {
+    redis  *ratelimiter.TokenBucket
+    local  *LocalRateLimiter  // Fallback
+    backup *PostgresLimiter   // Durable fallback
+}
+
+func (s *StrictRateLimiter) Allow(clientIP string) bool {
+    // Layer 1: Try Redis
+    if result, err := s.redis.Allow(ctx, clientIP); err == nil {
+        return result.Allowed
+    }
+
+    // Layer 2: Local rate limiter (conservative)
+    if !s.local.Allow(clientIP) {
+        return false
+    }
+
+    // Layer 3: Check Postgres quota (slow but durable)
+    quota := s.backup.GetQuota(clientIP)
+    if quota.Used >= quota.Limit {
+        return false
+    }
+
+    s.backup.IncrementQuota(clientIP, 1)
+    return true
+}
+```
+
+Trade-offs:
+- ✓ High durability (survives Redis failure)
+- ✗ Higher latency (~10-50ms for Postgres)
+- ✗ Complexity (3 systems to maintain)
+
+### Alternative Technologies
+
+**1. Envoy Rate Limiting** (Sidecar pattern)
+
+```yaml
+# envoy.yaml
+rate_limits:
+  - actions:
+      - request_headers:
+          header_name: x-forwarded-for
+          descriptor_key: client_ip
+    limit:
+      requests_per_unit: 100
+      unit: second
+```
+
+Pros:
+- Language agnostic (works with any backend)
+- Battle-tested (used by Lyft, Uber)
+- Integrated with service mesh
+
+Cons:
+- Requires Envoy deployment
+- Less flexible (no custom Lua scripts)
+- Higher resource usage (C++ process per pod)
+
+**2. AWS API Gateway** (Managed service)
+
+```yaml
+# serverless.yml
+provider:
+  name: aws
+  apiGateway:
+    usagePlan:
+      quota:
+        limit: 10000
+        period: DAY
+      throttle:
+        rateLimit: 100
+        burstLimit: 200
+```
+
+Pros:
+- Zero ops (fully managed)
+- Auto-scaling
+- Integrated with AWS ecosystem
+
+Cons:
+- Vendor lock-in
+- Higher cost ($3.50/million requests)
+- Less control (can't customize algorithm)
+
+**3. Kong Gateway** (Open source API gateway)
+
+```yaml
+# kong.yml
+plugins:
+  - name: rate-limiting
+    config:
+      minute: 100
+      policy: redis
+      redis_host: redis.example.com
+```
+
+Pros:
+- Feature-rich (auth, logging, transformations)
+- Active community
+- Hybrid cloud support
+
+Cons:
+- Heavyweight (many features you may not need)
+- Lua scripting (same as our implementation)
+- Requires PostgreSQL for config storage
+
+**Comparison**:
+
+| Solution | Throughput | Latency | Ops Burden | Cost | Flexibility |
+|----------|-----------|---------|------------|------|-------------|
+| **Our Implementation** | High | 1-2ms | Medium | Low | High |
+| Envoy | Very High | <1ms | Medium | Low | Medium |
+| AWS API Gateway | Very High | 2-5ms | None | High | Low |
+| Kong | High | 2-3ms | High | Medium | High |
+| Client-side | Unlimited | 0ms | Low | None | Low |
+
+### Migration Path (Zero Downtime)
+
+**Phase 1: Shadow Mode (Week 1)**
+```go
+// Log decisions but don't enforce
+result, _ := limiter.Allow(ctx, clientIP)
+log.Info("Would have rejected:", !result.Allowed)
+proxy.ServeHTTP(w, r)  // Always allow
+```
+
+**Phase 2: Gradual Rollout (Week 2-3)**
+```go
+// Enforce for 1% of traffic
+if hash(clientIP) % 100 < 1 {
+    if !result.Allowed {
+        return 429
+    }
+}
+```
+
+**Phase 3: Full Rollout (Week 4)**
+```go
+// Enforce for all traffic
+if !result.Allowed {
+    return 429
+}
+```
+
+**Rollback trigger**:
+- Error rate > 5%
+- p99 latency > 10ms
+- Customer complaints > 10/hour
 
 ## Production Considerations
 
