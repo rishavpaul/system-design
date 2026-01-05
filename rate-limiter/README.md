@@ -1106,16 +1106,19 @@ Main thread still single-threaded for execution!
 
 **Why single-threaded execution?**
 
+Redis uses single-threaded execution because **lock-free algorithms are faster than multi-threaded ones for in-memory operations**. Adding threads would require locks/mutexes on every data structure access, causing contention overhead that's slower than just processing commands sequentially—a single CPU core can execute ~100k simple operations/sec, which is plenty for most use cases. The single-threaded model also eliminates race conditions entirely (making Lua scripts atomically safe), provides predictable performance (no context switching jitter), and keeps the codebase simple. Redis's philosophy is **"scale out, not up"**: instead of fighting for performance on one multi-threaded node, just shard across multiple single-threaded nodes (Redis Cluster), which scales linearly and avoids the complexity of concurrent data structures. Modern Redis (6.0+) does use threads for I/O (socket reads/writes) since that's network-bound, but the core execution remains single-threaded because CPU-bound in-memory operations don't benefit from threading—they suffer from it.
+
 ✓ **Pros**:
-- No locks needed (zero contention overhead)
+- No locks needed (zero contention overhead, faster than mutex-protected multi-threading)
 - Atomic operations guaranteed (Lua scripts run exclusively)
-- Predictable performance (no thread scheduling jitter)
-- Simple mental model (no race conditions)
+- Predictable performance (no thread scheduling jitter, context switching overhead)
+- Simple mental model (no race conditions, easier to reason about)
+- Linear horizontal scaling (add nodes instead of fighting for multi-core performance)
 
 ✗ **Cons**:
-- CPU bound (can't use all cores for execution)
+- CPU bound (can't use all cores for execution on single node)
 - Long-running commands block everything
-- Max throughput ~100k ops/sec per instance
+- Max throughput ~100k ops/sec per instance (solved by clustering)
 
 **Lua Script Execution**:
 
