@@ -385,6 +385,191 @@ REDIS_MODE=cluster BUCKET_SIZE=100 REFILL_RATE=10.0 ./run.sh
 BACKEND_URL=http://api.example.com:3000 ./run.sh
 ```
 
+## System Design Concepts
+
+This implementation demonstrates several fundamental distributed systems concepts:
+
+### 1. Horizontal Scalability
+
+**Gateway Layer**: Stateless design allows unlimited horizontal scaling
+- Multiple gateway instances share the same Redis cluster
+- No coordination needed between gateways
+- Add capacity by deploying more gateway instances
+- Load balancer distributes traffic across gateways
+
+**Data Layer**: Redis Cluster provides horizontal data scaling
+- Data sharded across multiple master nodes using consistent hashing
+- Each shard handles 1/N of the total client base
+- Add shards by resharding the cluster (Redis handles slot migration)
+
+### 2. Partitioning Strategy: Hash-Based Sharding
+
+**Algorithm**: `CRC16(key) % 16384 = hash_slot`
+- 16,384 total hash slots distributed across master nodes
+- Deterministic: same key always routes to same shard
+- Uniform distribution: keys spread evenly across shards
+
+**Benefits**:
+- **Data locality**: All operations for a client hit one shard (low latency)
+- **No hotspots**: Traffic distributed evenly (assuming diverse client IPs)
+- **Independent shards**: No cross-shard coordination (high throughput)
+
+**Trade-offs**:
+- Cannot do global aggregations without fan-out queries
+- Resharding requires slot migration (temporary performance impact)
+- Hash collisions rare but possible (multiple clients on same shard)
+
+### 3. Replication and High Availability
+
+**Master-Replica Architecture**:
+- Each master has 1 replica (configurable)
+- Asynchronous replication: writes to master, replicated to replica
+- Replicas can serve reads (`ReadOnly: true` in cluster config)
+
+**Automatic Failover**:
+- If master fails, replica promoted to master (typically 1-2 seconds)
+- Redis Cluster uses Raft-like consensus for failover decisions
+- Majority of masters must agree on failover (prevents split-brain)
+
+**Consistency Model**: **Eventually consistent reads**
+- Writes go to master (strong consistency for writes)
+- Reads can come from replicas (may be slightly behind master)
+- Trade-off: Read scaling vs. read-after-write consistency
+- For rate limiting, eventual consistency is acceptable (slight over-limit OK)
+
+### 4. CAP Theorem Trade-offs
+
+In the face of network partitions, this system chooses **Availability over Consistency** (AP system):
+
+**During normal operation**:
+- ✓ Consistency: All gateways see same rate limit state (via Redis)
+- ✓ Availability: All gateways can serve requests
+- ✓ Partition tolerance: N/A (no partition)
+
+**During Redis failure** (fail-open strategy):
+- ✗ Consistency: Gateways cannot coordinate rate limits
+- ✓ Availability: Requests still processed (degraded mode)
+- ⚠️ Trade-off: Temporary lack of rate limiting vs. full outage
+
+**During network partition** (if Redis Cluster splits):
+- Minority partition: Cannot achieve quorum, read-only mode
+- Majority partition: Continues operating normally
+- Trade-off: Minority partition sacrifices availability for consistency
+
+### 5. Single Point of Failure Analysis
+
+**Standalone Mode SPOFs**:
+- ❌ Redis instance failure → All rate limiting lost (fail-open saves availability)
+- ✓ Gateway failure → Other gateways continue serving
+- ✓ Backend failure → Gateway returns 502 (isolated failure)
+
+**Cluster Mode Resilience**:
+- ✓ One master fails → Replica promotes, <2s downtime for that shard
+- ✓ One replica fails → Master continues, reads slightly slower
+- ⚠️ Majority of masters fail → Cluster becomes read-only
+- ✓ All replicas fail → Masters continue (no read scaling)
+
+**Production Recommendations**:
+- Use Redis Cluster (minimum 3 masters) for HA
+- Deploy gateways across multiple availability zones
+- Use Redis Sentinel or managed Redis (AWS ElastiCache, etc.)
+- Monitor Redis cluster health continuously
+
+### 6. Consistency Guarantees
+
+**Per-client strong consistency**:
+- Lua script executes atomically on one shard
+- Read-modify-write is a single operation
+- No race conditions even with concurrent requests
+- **Guarantee**: Client never exceeds rate limit (unless Redis fails)
+
+**Cross-client eventual consistency**:
+- Clients on different shards are independent
+- Failover may cause brief inconsistency during replica promotion
+- **Acceptable**: Rate limiting is per-client, not global
+
+**Edge case - Redis cluster failover**:
+- If master fails before replicating last writes, those writes are lost
+- Client might get a few extra requests during failover window
+- **Mitigation**: Use `wait` command for critical writes (adds latency)
+
+### 7. Network Partition Handling
+
+**Scenario**: Gateway can't reach Redis
+
+```go
+result, err := limiter.Allow(ctx, clientKey)
+if err != nil {
+    // Fail-open: allow request, add warning header
+    w.Header().Set("X-RateLimit-Warning", "rate-limiter-unavailable")
+    proxy.ServeHTTP(w, r)
+    return
+}
+```
+
+**Design choice: Fail-open** (prioritize availability)
+- Alternative: Fail-closed (prioritize security/billing)
+- Use case dependent: API gateway → fail-open, payment API → fail-closed
+
+**Scenario**: Redis Cluster split-brain (network partition between nodes)
+
+Redis Cluster's consensus mechanism prevents split-brain:
+- Requires majority of masters to be reachable
+- Minority partition enters `CLUSTERDOWN` state
+- Only majority partition continues serving writes
+
+### 8. Scalability Limits
+
+| Component | Bottleneck | Limit | Mitigation |
+|-----------|-----------|-------|------------|
+| Gateway | CPU (proxy overhead) | ~10k req/sec per instance | Horizontal scaling |
+| Redis (standalone) | Single-threaded | ~100k ops/sec | Use Redis Cluster |
+| Redis Cluster | Network I/O | ~1M ops/sec (3 masters) | Add more masters |
+| Memory | Client cardinality | ~10k clients/GB | TTL expiration, LRU eviction |
+
+**Real-world scaling example**:
+- 1 million unique clients/day
+- 100 requests/client/day
+- Peak: 10k req/sec
+- **Architecture**: 3 gateway instances + 3-master Redis cluster
+
+### 9. Latency Analysis
+
+**Latency breakdown** (per request):
+1. Client → Gateway: ~1-5ms (network RTT)
+2. Gateway rate limit check → Redis: ~0.5-1ms (LAN RTT + Lua exec)
+3. Gateway → Backend: ~10-50ms (depends on backend)
+4. Backend → Client: ~1-5ms (network RTT)
+
+**Total**: ~12-61ms (rate limiter adds <2ms)
+
+**Optimization strategies**:
+- Colocate gateway and Redis (same datacenter/AZ)
+- Use Redis Cluster read replicas for read scaling
+- Connection pooling (already done by go-redis)
+- Pipeline multiple Redis commands (not applicable here - single command)
+
+### 10. Data Locality and Cache Efficiency
+
+**Key insight**: All data for a client lives on one Redis shard
+
+**Benefits**:
+- Single roundtrip per request (no multi-get)
+- CPU cache friendly (same shard serves repeated requests)
+- No distributed transactions (avoid 2PC overhead)
+
+**Example**:
+```
+Client 1.1.1.1 → shard 1 (always)
+Client 2.2.2.2 → shard 2 (always)
+Client 3.3.3.3 → shard 3 (always)
+```
+
+This is **much faster** than:
+- Global counter requiring consensus (Raft, Paxos)
+- Multi-shard aggregation (fan-out queries)
+- Distributed lock acquisition (ZooKeeper, etcd)
+
 ## Performance Characteristics
 
 - **Latency overhead**: 1-2ms (Redis RTT + Lua execution)

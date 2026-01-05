@@ -32,6 +32,29 @@ func main() {
 	// Initialize Redis client based on mode
 	var redisClient redis.Cmdable
 	if redisMode == "cluster" {
+		// CLUSTER MODE ROUTING EXPLANATION:
+		// Redis Cluster automatically shards data across multiple nodes using consistent hashing.
+		// Key routing process:
+		//   1. Client computes CRC16(key) % 16384 to get the hash slot (0-16383)
+		//   2. Each master node owns a range of hash slots (e.g., master1: 0-5460, master2: 5461-10922, master3: 10923-16383)
+		//   3. The redis-cli library automatically routes each command to the correct master based on the key's hash slot
+		//   4. If a node returns MOVED/ASK redirect, the client automatically follows the redirect
+		//
+		// Example: key "ratelimit:192.168.1.1" → CRC16 hash → slot 12345 → routed to master3
+		//
+		// REPLICA CONFIGURATION:
+		// The cluster is configured with REPLICAS=1 (set in cluster-setup.sh line 16)
+		// This creates one replica for each master node:
+		//   - Master1 (7000) → Replica1 (7003)
+		//   - Master2 (7001) → Replica2 (7004)
+		//   - Master3 (7002) → Replica3 (7005)
+		// Replicas provide:
+		//   - High availability: automatic failover if a master dies
+		//   - Read scaling: ReadOnly=true allows reads from replicas (see below)
+		//
+		// SYSTEM DESIGN BENEFIT: This architecture provides horizontal scalability and fault tolerance.
+		// Multiple gateway instances can share the same Redis cluster without coordination.
+
 		// Cluster mode: use REDIS_ADDRS (comma-separated list of addresses)
 		redisAddrs := getEnv("REDIS_ADDRS", "localhost:7000,localhost:7001,localhost:7002")
 		addrs := strings.Split(redisAddrs, ",")
@@ -44,9 +67,9 @@ func main() {
 			DialTimeout:    2 * time.Second,
 			ReadTimeout:    1 * time.Second,
 			WriteTimeout:   1 * time.Second,
-			ReadOnly:       true,                    // Allow reads from replicas
-			RouteRandomly:  true,                    // Distribute reads across nodes
-			MaxRetries:     3,                       // Retry on failure
+			ReadOnly:       true,                    // Allow reads from replicas (read scaling)
+			RouteRandomly:  true,                    // Distribute reads across master + replicas (load balancing)
+			MaxRetries:     3,                       // Retry on failure (resilience)
 		})
 		log.Printf("Using Redis Cluster mode with addresses: %v", addrs)
 	} else {

@@ -76,6 +76,30 @@ func NewTokenBucket(client redis.Cmdable, bucketSize int64, refillRate float64) 
 }
 
 // Allow checks if a request should be allowed for the given key
+//
+// CLUSTER SHARDING MECHANISM:
+// In a Redis cluster, this function's key parameter (e.g., "ratelimit:192.168.1.1") determines
+// which shard/master node handles the request:
+//
+//   1. Key-based routing: CRC16("ratelimit:192.168.1.1") % 16384 = hash slot
+//   2. The go-redis library automatically routes the Lua script to the master owning that slot
+//   3. All operations for the same client IP always hit the same shard (data locality)
+//   4. Different client IPs are distributed across shards (horizontal scaling)
+//
+// Example distribution:
+//   - Client "192.168.1.1" → slot 4231 → Master1
+//   - Client "192.168.1.2" → slot 9876 → Master2
+//   - Client "192.168.1.3" → slot 15234 → Master3
+//
+// ATOMICITY GUARANTEE:
+// Because all operations for a single key happen on one shard, the Lua script remains atomic
+// even in cluster mode. There's no distributed coordination needed - each shard independently
+// manages its subset of clients.
+//
+// SYSTEM DESIGN TRADE-OFF:
+// ✓ Pros: Simple, fast, no cross-shard transactions
+// ✗ Cons: Can't do global rate limits (e.g., "100 req/sec across ALL clients")
+//         Each client's limit is independent and sharded
 func (tb *TokenBucket) Allow(ctx context.Context, key string) (*Result, error) {
 	now := float64(time.Now().UnixNano()) / float64(time.Second)
 
