@@ -1,0 +1,113 @@
+// Example: Using github.com/emirpasic/gods library
+// This is a reference implementation - not currently used
+
+package orderbook
+
+import (
+	rbt "github.com/emirpasic/gods/trees/redblacktree"
+	"github.com/emirpasic/gods/utils"
+)
+
+// RBTreeWithGods wraps gods library with our custom interface
+type RBTreeWithGods struct {
+	tree       *rbt.Tree
+	minCache   *PriceLevel // Cached for O(1) access
+	maxCache   *PriceLevel // Cached for O(1) access
+	descending bool
+}
+
+func NewRBTreeWithGods(descending bool) *RBTreeWithGods {
+	var comparator utils.Comparator
+	if descending {
+		// Reverse comparator for descending order
+		comparator = func(a, b interface{}) int {
+			return -utils.Int64Comparator(a, b)
+		}
+	} else {
+		comparator = utils.Int64Comparator
+	}
+
+	return &RBTreeWithGods{
+		tree:       rbt.NewWith(comparator),
+		descending: descending,
+	}
+}
+
+func (t *RBTreeWithGods) Size() int {
+	return t.tree.Size()
+}
+
+func (t *RBTreeWithGods) IsEmpty() bool {
+	return t.tree.Empty()
+}
+
+func (t *RBTreeWithGods) Min() *PriceLevel {
+	if t.descending {
+		return t.maxCache
+	}
+	return t.minCache
+}
+
+func (t *RBTreeWithGods) Get(price int64) *PriceLevel {
+	value, found := t.tree.Get(price)
+	if !found {
+		return nil
+	}
+	return value.(*PriceLevel)
+}
+
+func (t *RBTreeWithGods) Insert(level *PriceLevel) {
+	t.tree.Put(level.Price, level)
+
+	// Update caches
+	if t.minCache == nil || level.Price < t.minCache.Price {
+		t.minCache = level
+	}
+	if t.maxCache == nil || level.Price > t.maxCache.Price {
+		t.maxCache = level
+	}
+}
+
+func (t *RBTreeWithGods) Delete(price int64) {
+	t.tree.Remove(price)
+
+	// Rebuild caches if needed (gods doesn't provide min/max caching)
+	if t.minCache != nil && t.minCache.Price == price {
+		if t.tree.Empty() {
+			t.minCache = nil
+		} else {
+			// Get new minimum
+			it := t.tree.Iterator()
+			if it.First() {
+				t.minCache = it.Value().(*PriceLevel)
+			}
+		}
+	}
+	if t.maxCache != nil && t.maxCache.Price == price {
+		if t.tree.Empty() {
+			t.maxCache = nil
+		} else {
+			// Get new maximum
+			it := t.tree.Iterator()
+			if it.Last() {
+				t.maxCache = it.Value().(*PriceLevel)
+			}
+		}
+	}
+}
+
+func (t *RBTreeWithGods) ForEach(fn func(*PriceLevel) bool) {
+	it := t.tree.Iterator()
+	for it.Next() {
+		level := it.Value().(*PriceLevel)
+		if !fn(level) {
+			break
+		}
+	}
+}
+
+// Issues with gods approach:
+// 1. Cache invalidation on delete requires tree traversal (O(log n))
+// 2. More complex wrapper code
+// 3. External dependency
+// 4. Less control over memory layout
