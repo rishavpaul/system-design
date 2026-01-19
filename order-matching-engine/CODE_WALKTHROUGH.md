@@ -31,6 +31,17 @@ order-matching-engine/
 └── internal/marketdata/        → Real-time data publishing
 ```
 
+**📁 Browse the code:**
+- [cmd/server/main.go](./cmd/server/main.go) - HTTP server and gateway
+- [internal/matching/engine.go](./internal/matching/engine.go) - Core matching engine
+- [internal/orderbook/orderbook.go](./internal/orderbook/orderbook.go) - Order book implementation
+- [internal/orderbook/pricelevel.go](./internal/orderbook/pricelevel.go) - Price level FIFO queue
+- [internal/orderbook/rbtree.go](./internal/orderbook/rbtree.go) - Red-black tree
+- [internal/risk/checker.go](./internal/risk/checker.go) - Risk management
+- [internal/events/log.go](./internal/events/log.go) - Event sourcing
+- [internal/settlement/clearing.go](./internal/settlement/clearing.go) - Settlement
+- [internal/marketdata/publisher.go](./internal/marketdata/publisher.go) - Market data
+
 ### High-Level Data Flow
 
 ```
@@ -76,7 +87,7 @@ HTTP POST /order
 
 ### 1. Order Submission Path
 
-**Entry Point:** `handleOrder()` in `cmd/server/main.go`
+**Entry Point:** `handleOrder()` in [`cmd/server/main.go`](./cmd/server/main.go#L181)
 
 ```
 User submits: {"symbol": "AAPL", "side": "buy", "price": "150.50", "quantity": 100}
@@ -106,7 +117,7 @@ s.mu.Unlock()
 
 ### 2. Matching Engine Core
 
-**Function:** `ProcessOrder()` in `internal/matching/engine.go`
+**Function:** `ProcessOrder()` in [`internal/matching/engine.go`](./internal/matching/engine.go#L83)
 
 ```
 ProcessOrder(order) {
@@ -169,7 +180,7 @@ After matching completes:
 
 ### Pattern 1: Matching Both Sides with Closures
 
-**Function:** `matchOrder()` in `internal/matching/engine.go`
+**Function:** `matchOrder()` in [`internal/matching/engine.go`](./internal/matching/engine.go#L162)
 
 One matching loop handles both buy and sell orders using closures:
 
@@ -251,7 +262,7 @@ for node := level.Head(); node != nil && order.RemainingQty() > 0; {
 
 ### Pattern 3: Three Data Structures Combined
 
-**Files:** `internal/orderbook/orderbook.go` + `pricelevel.go` + `rbtree.go`
+**Files:** [`orderbook.go`](./internal/orderbook/orderbook.go) + [`pricelevel.go`](./internal/orderbook/pricelevel.go) + [`rbtree.go`](./internal/orderbook/rbtree.go)
 
 The order book achieves multiple performance goals by combining structures:
 
@@ -347,7 +358,7 @@ GetBestAsk() {
 
 ### Pattern 4: Non-Blocking Market Data
 
-**Function:** `PublishL1()` and `PublishTrade()` in `internal/marketdata/publisher.go`
+**Function:** `PublishL1()` and `PublishTrade()` in [`internal/marketdata/publisher.go`](./internal/marketdata/publisher.go)
 
 Market data uses non-blocking sends to prevent slow subscribers from blocking the matching engine:
 
@@ -790,16 +801,51 @@ Throughput: ~1.5M orders/sec on commodity hardware
 
 ## Next Steps
 
-To explore the code:
+### Explore the Code
 
-1. **Start with:** `internal/matching/engine.go` - Core matching logic
-2. **Then read:** `internal/orderbook/orderbook.go` - Data structure
-3. **Understand:** `internal/orderbook/pricelevel.go` - FIFO queue
-4. **See tests:** `tests/integration_test.go` - Real scenarios
+**Recommended reading order:**
 
-To modify the system:
+1. **Start with:** [`internal/matching/engine.go`](./internal/matching/engine.go) - Core matching logic
+   - Read `ProcessOrder()` to understand the main flow
+   - Study `matchOrder()` to see FIFO matching in action
 
-- Add new order type → Extend `matchOrder()` logic
-- Change FIFO to Pro-Rata → Modify `PriceLevel.Head()` distribution
-- Add market maker protections → Extend `riskChecker.Check()`
-- Optimize performance → Profile with `pprof`, focus on hot paths
+2. **Then read:** [`internal/orderbook/orderbook.go`](./internal/orderbook/orderbook.go) - Data structure
+   - See how `AddOrder()` combines three data structures
+   - Understand `CancelOrder()` O(1) complexity
+
+3. **Understand:** [`internal/orderbook/pricelevel.go`](./internal/orderbook/pricelevel.go) - FIFO queue
+   - Study `Append()` for adding orders to tail
+   - Study `Remove()` for O(1) removal anywhere
+
+4. **See HTTP layer:** [`cmd/server/main.go`](./cmd/server/main.go) - HTTP gateway
+   - Study `handleOrder()` for request processing
+   - See how components are orchestrated
+
+5. **Run tests:** [`tests/integration_test.go`](./tests/integration_test.go) - Real scenarios
+   - See complete end-to-end test cases
+   - Understand verification patterns
+
+### Modify the System
+
+**Common modifications:**
+
+| Goal | What to Change | Files to Edit |
+|------|---------------|---------------|
+| Add new order type (e.g., Stop-Loss) | Extend matching logic | [`engine.go`](./internal/matching/engine.go#L162) + [`types.go`](./internal/orders/types.go) |
+| Change FIFO to Pro-Rata | Modify distribution algorithm | [`pricelevel.go`](./internal/orderbook/pricelevel.go#L65) |
+| Add maker/taker fees | Track and calculate fees | [`engine.go`](./internal/matching/engine.go#L219) |
+| Add market maker protections | Extend risk checks | [`checker.go`](./internal/risk/checker.go) |
+| Optimize performance | Profile with `pprof` | Focus on hot paths in matching |
+| Add WebSocket support | Real-time streaming | [`publisher.go`](./internal/marketdata/publisher.go) |
+
+### Performance Profiling
+
+```bash
+# Run with profiling enabled
+go run ./cmd/server -cpuprofile=cpu.prof
+
+# Analyze profile
+go tool pprof cpu.prof
+> top10        # Show top 10 functions by CPU time
+> list matchOrder  # Show source code with timing
+```
