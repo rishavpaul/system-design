@@ -315,6 +315,16 @@ llm-hosting/
 
 ---
 
+## 10b. Production challenges & problem backlog
+
+The real-world failure modes (cold starts, KV-cache limits, OOM crashes, noisy
+neighbors, cost-DoS, model lifecycle, reproducibility) and a set of solvable,
+measurable **problem statements** for each live in
+**[docs/production-challenges.md](./docs/production-challenges.md)**. Pull the relevant
+ones into each phase as you build.
+
+---
+
 ## 11. Open questions to revisit (not blocking)
 
 - Domain name for the public endpoint (needed for clean TLS in Phase 2).

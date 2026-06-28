@@ -12,6 +12,10 @@ not a toy demo.
 📋 **[PLAN.md](./PLAN.md)** — the full master plan: architecture, phased build steps,
 benchmarking methodology, cost model, and security concerns.
 
+⚠️ **[docs/production-challenges.md](./docs/production-challenges.md)** — the major
+production failure modes + a backlog of solvable, measurable problem statements
+(difficulty-graded) to work through.
+
 ## The one-line objective
 
 > *"For a given workload and latency SLO, find the cheapest model + GPU + serving
