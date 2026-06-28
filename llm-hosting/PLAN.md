@@ -315,6 +315,14 @@ llm-hosting/
 
 ---
 
+## 10a. Step-by-step implementation runbook
+
+For a fully prescriptive, copy-paste build guide (exact commands, complete file contents,
+and a VERIFY check after every step — written so a small/cheap coding model can execute it
+without making decisions), see **[docs/IMPLEMENTATION.md](./docs/IMPLEMENTATION.md)**.
+
+---
+
 ## 10b. Production challenges & problem backlog
 
 The real-world failure modes (cold starts, KV-cache limits, OOM crashes, noisy

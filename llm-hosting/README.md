@@ -16,6 +16,10 @@ benchmarking methodology, cost model, and security concerns.
 production failure modes + a backlog of solvable, measurable problem statements
 (difficulty-graded) to work through.
 
+🛠️ **[docs/IMPLEMENTATION.md](./docs/IMPLEMENTATION.md)** — a copy-paste, step-by-step
+runbook (with full file contents and VERIFY checks) written so a small/cheap coding
+model can build the whole stack with no architectural decisions.
+
 ## The one-line objective
 
 > *"For a given workload and latency SLO, find the cheapest model + GPU + serving
